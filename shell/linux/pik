@@ -46,9 +46,9 @@ _remove_partitions() {
 }
 
 # --- calsecs_help
-help() {
+_help() {
   cat << EOF
-calsecs <ACTION> <OPTIONS>
+pic <ACTION> <OPTIONS>
   actions:
     h: help
     S: setup pi sd-card
@@ -57,7 +57,7 @@ EOF
 }
 
 # --- check if option passed
-[[ -z "${1}" ]] && calsecs_help
+[[ -z "${1}" ]] && _help
 while getopts "dhS" opt; do
   case ${opt} in
 
@@ -65,7 +65,7 @@ while getopts "dhS" opt; do
     d) CALSECS_DELETE=true ;;
 
     # --- ACTIONS
-    h) ACTION=help ;;
+    h) ACTION=_help ;;
     S) ACTION=action_sd_setup ;;
 
     # --- MISC
