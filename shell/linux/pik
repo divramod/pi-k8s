@@ -2,6 +2,28 @@
 : "${PATH_BASE:="$(git rev-parse --show-toplevel)"}" 
 ACTION=''
 PIK_DEVICE=''
+SWITCH_SD_UMOUNT=false
+SWITCH_SSH_KEY=true
+
+action_update_kubeconfig() {
+  local ip_master_0=$(cat ${PATH_BASE}/ansible/hosts.ini  | grep "ansible-host" | sed "s/=/ /g" | awk '{print $1 " " $3}' | grep k3s-master-0 | awk '{print $2}')
+  scp \
+    -o "StrictHostKeyChecking no" \
+    -i "${PATH_BASE}"/.secrets/id_rsa_pik_no_pass \
+    root@${ip_master_0}:/etc/rancher/k3s/k3s.yaml \
+    ${PATH_BASE}/.secrets/
+  sed -i 's/127.0.0.1/'${ip_master_0}'/g' .secrets/k3s.yaml
+}
+
+action_ansible() {
+  cd "${PATH_BASE}"/ansible
+  ansible-playbook \
+    -i hosts.ini \
+    --user root \
+    --flush-cache \
+    --private-key "${PATH_BASE}"/.secrets/id_rsa_pik_no_pass \
+    playbook.yaml
+}
 
 # https://opensource.com/article/20/3/kubernetes-raspberry-pi-k3s
 # [2] PROVSISION SERVER
@@ -12,15 +34,7 @@ action_pi_init() {
   local ip=$(sudo arp-scan -I "${interface}" -localnet -plain | fzf | awk '{print $1}')
   [[ -z "${ip}" ]] && echo "Aborted!" && exit
   ssh -o "StrictHostKeyChecking no" -t root@"${ip}" "curl -sfL https://get.k3s.io | sh -"
-}
 
-action_ssh_connect() {
-  local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
-  [[ -z "${interface}" ]] && echo "Aborted!" && exit
-  local ip=$(sudo arp-scan -I "${interface}" -localnet -plain | fzf | awk '{print $1}')
-  [[ -z "${ip}" ]] && echo "Aborted!" && exit
-  ssh -o "StrictHostKeyChecking no" pi@"${ip}"
-  # ssh -o "StrictHostKeyChecking no" -t root@"${ip}" "calsecs_glo_install"
 }
 
 # --- prepare a sd card for a headless start
@@ -37,21 +51,17 @@ action_sd_setup() {
   local path_boot="${PATH_BASE}"/.tmp/mounts/boot
   local path_rootfs="${PATH_BASE}"/.tmp/mounts/rootfs
   local file_interface=${path_rootfs}/etc/dhcpcd.conf
-  local device=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep "mmcblk" | fzf)
+  local device=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep "mmcblk0" | fzf)
   local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
+  local hosts=$(cat ${PATH_BASE}/ansible/hosts.ini  | grep "ansible-host" | sed "s/=/ /g" | awk '{print $1 " " $3}')
+  local host=$(cat ${PATH_BASE}/ansible/hosts.ini  | grep "ansible-host" | sed "s/=/ /g" | awk '{print $1 " " $3}' | fzf)
+  local host_ip=$(echo ${host} | awk '{print $2}' )
+  local host_name=$(echo ${host} | awk '{print $1}' )
   local ip_dhcp=$(ip route | grep ${interface} | grep default | awk '{print $3}')
-  local ip_pi=(_get_free_ip)
   local ip_first_3=$(echo ${ip_dhcp} | head -c 11)
-  local ips_used=$(sudo arp-scan -I ${interface} --localnet --plain | awk '{print $1}')
   local file_image
   local partition_count=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep ${device} | wc -l)
   local images_count=$(find images -name '*.img' -type f | wc -l)
-  local ip_pi=$(for (( i = 1; i < 256; i++ )); do
-    local ip_to_check="${ip_first_3}"."${i}"
-    if [[ "${ips_used}" != *"${ip_to_check}"* ]]; then
-      echo ${ip_to_check} 
-    fi
-  done | fzf)
 
   # --- [log]
   echo "partition_count: ${partition_count}" 
@@ -59,11 +69,15 @@ action_sd_setup() {
   echo "device: ${device}" 
 
   # --- [umount]
-  sudo umount "${path_rootfs}"
-  sudo umount "${path_boot}"
+  sudo umount -f -l "${path_rootfs}"
+  sudo umount -f -l "${path_boot}"
 
   # --- [mkdir] images
   mkdir -p images
+  rm -rf "${path_boot}" 
+  rm -rf "${path_rootfs}" 
+  mkdir -p "${path_boot}" 
+  mkdir -p "${path_rootfs}" 
 
   # --- [cd] pb 
   cd "${PATH_BASE}" 
@@ -92,7 +106,6 @@ action_sd_setup() {
   read -p "Do you want to copy the image to device ${device}? (yY)" -n 1 -r && echo
   if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
     _dd ${device} ${file_image} 
-    sleep 10
   fi
 
   # --- [mount] sd card partitions seperately
@@ -113,24 +126,121 @@ action_sd_setup() {
   done <<< "$partitions"
 
   # --- [config] ssh
+  # * https://www.raspberrypi.org/documentation/remote-access/ssh/passwordless.md
   sudo touch "${path_boot}"/ssh
+  sudo mkdir -p "${path_rootfs}"/home/pi/.ssh
+  sudo cp "${PATH_BASE}"/.secrets/id_rsa_pik_no_pass.pub "${path_rootfs}"/home/pi/.ssh/authorized_keys
+  sudo mkdir -p "${path_rootfs}"/root/.ssh
+  sudo cp "${PATH_BASE}"/.secrets/id_rsa_pik_no_pass.pub "${path_rootfs}"/root/.ssh/authorized_keys
 
   # --- [config] dhcp 
   echo "interface eth0" | sudo tee -a "${file_interface}"
-  echo "static ip_address=${ip_pi}/24" | sudo tee -a "${file_interface}"
+  echo "static ip_address=${host_ip}/24" | sudo tee -a "${file_interface}"
   echo "static routers=${ip_dhcp}" | sudo tee -a "${file_interface}"
   echo "static domain_name_servers=${ip_dhcp}" | sudo tee -a "${file_interface}"
+
+  # --- [config] /etc/hosts 
+  while IFS= read -r ansible_host; do
+    local ip=$(echo "${ansible_host}" | awk '{print $2}' )
+    local hostname=$(echo "${ansible_host}" | awk '{print $1}' )
+    echo -e "${ip}\\${hostname}" | sudo tee -a /etc/hosts
+  done <<< "$hosts"
+
+  # --- [config] /etc/hosts 
+  local file_hostname="${path_rootfs}"/etc/hostname
+  sudo sh -c "echo ${host_name} > ${file_hostname}"
 
   # --- [sync] the written files 
   sync
 
   # --- [umount] the partitions
-  # sudo umount "${path_rootfs}"
-  # sudo umount "${path_boot}"
+  if [[ "${SWITCH_SD_UMOUNT}" = "true" ]]; then
+    echo "[unmounting]"
+    sudo umount -f -l "${path_rootfs}"
+    sudo umount -f -l "${path_boot}"
+  else
+    read -p "Do you want to unmount the partitions? (yY)" -n 1 -r
+    if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+      echo "[unmounting]"
+      sudo umount -f -l "${path_rootfs}"
+      sudo umount -f -l "${path_boot}"
+    fi
+  fi 
 
   # --- [log]  
   echo "FINISHED" 
 
+}
+
+action_ssh_connect() {
+  local host=$(cat ${PATH_BASE}/ansible/hosts.ini  | grep "ansible-host" | sed "s/=/ /g" | awk '{print $1 " " $3}' | fzf)
+  local host_ip=$(echo ${host} | awk '{print $2}' )
+  [[ -z "${host_ip}" ]] && echo "Aborted!" && exit
+  if [[ "${SWITCH_SSH_KEY}" = "true" ]]; then
+    echo "key" 
+    ssh -i "${PATH_BASE}"/.secrets/id_rsa_pik_no_pass -o "StrictHostKeyChecking no" pi@"${host_ip}"
+  else
+    ssh -o "StrictHostKeyChecking no" pi@"${host_ip}"
+  fi
+}
+
+action_ssh_connect_arp() {
+  local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
+  [[ -z "${interface}" ]] && echo "Aborted!" && exit
+  local ip=$(sudo arp-scan -I "${interface}" -localnet -plain | fzf | awk '{print $1}')
+  [[ -z "${ip}" ]] && echo "Aborted!" && exit
+  if [[ "${SWITCH_SSH_KEY}" = "true" ]]; then
+    ssh -i "${PATH_BASE}"/.secrets/id_rsa_pik -o "StrictHostKeyChecking no" pi@"${ip}"
+  else
+    ssh -o "StrictHostKeyChecking no" pi@"${ip}"
+  fi
+  # ssh -o "StrictHostKeyChecking no" -t root@"${ip}" "calsecs_glo_install"
+}
+
+action_sd_umount() {
+  local path_boot="${PATH_BASE}"/.tmp/mounts/boot
+  local path_rootfs="${PATH_BASE}"/.tmp/mounts/rootfs
+  mkdir -p "${path_boot}" 
+  mkdir -p "${path_rootfs}" 
+  local device=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep "mmcblk" | fzf)
+  local partitions=$(_device_get_partitions "${device}")
+  device="${device#"${device%%[![:space:]]*}"}"
+  device="${device%"${device##*[![:space:]]}"}"   
+  echo "device: ${device}" 
+  echo "partitions: ${partitions}" 
+  while IFS= read -r partition; do
+      if [ "${partition}" = "p1" ]; then
+        echo "- umount ${partition} to ${path_boot}"
+        sudo umount /dev/"${device}"p1 "${path_boot}" 
+      fi 
+      if [ "${partition}" = "p2" ]; then
+        echo "- umount ${partition} to ${path_rootfs}"
+        sudo umount /dev/"${device}"p2 "${path_rootfs}" 
+      fi 
+  done <<< "$partitions"
+}
+
+action_sd_mount() {
+  local path_boot="${PATH_BASE}"/.tmp/mounts/boot
+  local path_rootfs="${PATH_BASE}"/.tmp/mounts/rootfs
+  mkdir -p "${path_boot}" 
+  mkdir -p "${path_rootfs}" 
+  local device=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep "mmcblk" | fzf)
+  local partitions=$(_device_get_partitions "${device}")
+  device="${device#"${device%%[![:space:]]*}"}"
+  device="${device%"${device##*[![:space:]]}"}"   
+  echo "device: ${device}" 
+  echo "partitions: ${partitions}" 
+  while IFS= read -r partition; do
+      if [ "${partition}" = "p1" ]; then
+        echo "- mount ${partition} to ${path_boot}"
+        sudo mount /dev/"${device}"p1 "${path_boot}" 
+      fi 
+      if [ "${partition}" = "p2" ]; then
+        echo "- mount ${partition} to ${path_rootfs}"
+        sudo mount /dev/"${device}"p2 "${path_rootfs}" 
+      fi 
+  done <<< "$partitions"
 }
 
 _get_free_ip() {
@@ -223,15 +333,21 @@ EOF
 
 # --- check if option passed
 [[ -z "${1}" ]] && _help
-while getopts "d:hsST" opt; do
+while getopts "d:hkmsuAKMSTU" opt; do
   case ${opt} in
 
     # --- OPTIONS
     d) PIK_DEVICE=$OPTARG ;;
+    k) SWITCH_SSH_KEY=false ;;
     s) ACTION=action_ssh_connect ;;
+    u) SWITCH_SD_UMOUNT=true ;;
 
     # --- ACTIONS
     h) ACTION=_help ;;
+    A) ACTION=action_ansible ;;
+    K) ACTION=action_update_kubeconfig ;;
+    M) ACTION=action_sd_mount ;;
+    U) ACTION=action_sd_umount ;;
     S) ACTION=action_sd_setup ;;
     # T) ACTION=_dd ;;
     # T) ACTION=_remove_partitions; PIK_DEVICE=mmcblk0 ;;

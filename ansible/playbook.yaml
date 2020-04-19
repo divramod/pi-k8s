@@ -1,0 +1,41 @@
+# https://opensource.com/article/20/3/kubernetes-raspberry-pi-k3s
+# #https://opensource.com/article/20/3/kubernetes-raspberry-pi-k3s
+
+# - hosts: all
+#   become: yes
+#   tasks:
+#   - name: "dist-upgrade"
+#     shell: |
+#       sudo apt -y update
+#       sudo apt -y dist-upgrade
+#     register: result
+- hosts: k3s-master
+  become: yes
+  tasks:
+  - name: "k3s install master"
+    shell: |
+      curl -sfL https://get.k3s.io | sh -
+    register: result
+  - debug: 
+      var: result.stdout
+- hosts: k3s-master
+  become: yes
+  tasks:
+  - name: "k3s master register token"
+    shell: sudo cat /var/lib/rancher/k3s/server/node-token
+    register: K3S_TOKEN
+  - debug: 
+      var: K3S_TOKEN.stdout
+  - name: "Add K3S Token and Hash to dummy host"
+    add_host:
+      name:   "K3S_TOKEN_HOLDER"
+      token:  "{{ K3S_TOKEN.stdout }}"
+- hosts: k3s-worker
+  become: yes
+  tasks:
+  - name: "k3s install worker"
+    shell: |
+      curl -sfL http://get.k3s.io | K3S_URL=https://192.168.178.220:6443 K3S_TOKEN={{ hostvars['K3S_TOKEN_HOLDER']['token'] }} sh -
+    register: WORKER_OUTPUT
+  - debug: 
+      var: WORKER_OUTPUT.stdout
