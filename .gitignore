@@ -1,1 +1,4 @@
 images
+.gitsecret/keys/random_seed
+.secrets/*
+!*.secret

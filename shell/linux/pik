@@ -1,48 +1,210 @@
 #!/usr/bin/env bash
 : "${PATH_BASE:="$(git rev-parse --show-toplevel)"}" 
 ACTION=''
+PIK_DEVICE=''
+
+# https://opensource.com/article/20/3/kubernetes-raspberry-pi-k3s
+# [2] PROVSISION SERVER
+# * [ ] provsion master https://opensource.com/article/20/3/kubernetes-raspberry-pi-k3s
+action_pi_init() {
+  local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
+  [[ -z "${interface}" ]] && echo "Aborted!" && exit
+  local ip=$(sudo arp-scan -I "${interface}" -localnet -plain | fzf | awk '{print $1}')
+  [[ -z "${ip}" ]] && echo "Aborted!" && exit
+  ssh -o "StrictHostKeyChecking no" -t root@"${ip}" "curl -sfL https://get.k3s.io | sh -"
+}
+
+action_ssh_connect() {
+  local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
+  [[ -z "${interface}" ]] && echo "Aborted!" && exit
+  local ip=$(sudo arp-scan -I "${interface}" -localnet -plain | fzf | awk '{print $1}')
+  [[ -z "${ip}" ]] && echo "Aborted!" && exit
+  ssh -o "StrictHostKeyChecking no" pi@"${ip}"
+  # ssh -o "StrictHostKeyChecking no" -t root@"${ip}" "calsecs_glo_install"
+}
 
 # --- prepare a sd card for a headless start
 # * tut https://carpie.net/articles/headless-pi-with-static-ip-wired-edition
 # * rasbian https://www.raspberrypi.org/downloads/raspbian
 # * list devices https://www.lifewire.com/how-to-use-linux-to-find-the-names-of-the-devices-on-your-computer-4078068
+# [1] SETUP PI
+# * [ ] add ssh pub key to sd card
+# * [ ] change hostname https://www.cyberciti.biz/faq/linux-change-hostname/ 
+# * [ ] change password
 action_sd_setup() {
-  echo 'setup sd'
-  mkdir -p images
-  cd "${PATH_BASE}" 
-  local images_count=$(find images -name '*.img' -type f | wc -l)
-  local file_image
-  [ "${images_count}" == 0 ] && echo "No image existant. Download one at https://www.raspberrypi.org/downloads/raspbian!" && exit
-    file_image=$(find images -name '*.img' -type f | fzf)
-  [ -z "${file_image}" ] && echo "No image choosen. Aborted!" && exit
+
+  # --- [set] vars
+  local path_boot="${PATH_BASE}"/.tmp/mounts/boot
+  local path_rootfs="${PATH_BASE}"/.tmp/mounts/rootfs
+  local file_interface=${path_rootfs}/etc/dhcpcd.conf
   local device=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep "mmcblk" | fzf)
-  [ -z "${device}" ] && echo "No device choosen. Aborted!" && exit
+  local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
+  local ip_dhcp=$(ip route | grep ${interface} | grep default | awk '{print $3}')
+  local ip_pi=(_get_free_ip)
+  local ip_first_3=$(echo ${ip_dhcp} | head -c 11)
+  local ips_used=$(sudo arp-scan -I ${interface} --localnet --plain | awk '{print $1}')
+  local file_image
   local partition_count=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep ${device} | wc -l)
-  echo "partition_count: ${partition_count}" 
-  if [[ "${partition_count}" > 1 ]]; then
-    read -p "Do you want to delete some partitions? (yY)" -n 1 -r
-    echo    # (optional) move to a new line
-    if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
-      echo "Deleting now"
-      # local partition_count=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep ${device} | wc -l)
-      # local partitions=$(sudo sfdisk -l /dev/mmcblk0 | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3)
-      sudo sfdisk -l /dev/"${device}" | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3 | xargs -I {} sh -c "partition={}; echo \${partition}"
+  local images_count=$(find images -name '*.img' -type f | wc -l)
+  local ip_pi=$(for (( i = 1; i < 256; i++ )); do
+    local ip_to_check="${ip_first_3}"."${i}"
+    if [[ "${ips_used}" != *"${ip_to_check}"* ]]; then
+      echo ${ip_to_check} 
     fi
-  fi
+  done | fzf)
+
+  # --- [log]
+  echo "partition_count: ${partition_count}" 
   echo "file_image: ${file_image}"
   echo "device: ${device}" 
-  read -p "Do you want to copy the image ${file_image} to device ${device}? (yY)" -n 1 -r
-  echo    # (optional) move to a new line
-  if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
-    # sudo umount /dev/"${device}" 2>/dev/null
-    # sudo dd if="${PATH_BASE}/${file_image}" of=/dev/"${device}" bs=16M
-    echo
+
+  # --- [umount]
+  sudo umount "${path_rootfs}"
+  sudo umount "${path_boot}"
+
+  # --- [mkdir] images
+  mkdir -p images
+
+  # --- [cd] pb 
+  cd "${PATH_BASE}" 
+
+  # --- [check] images existant
+  [ "${images_count}" == 0 ] && echo "No image existant. Download one at https://www.raspberrypi.org/downloads/raspbian!" && exit
+
+  # --- [set] image file
+  file_image=$(find images -name '*.img' -type f | fzf)
+  [ -z "${file_image}" ] && echo "No image choosen. Aborted!" && exit
+
+  # --- [set] device 
+  [ -z "${device}" ] && echo "No device choosen. Aborted!" && exit
+
+  # --- [check] partitions exist on device and ask if they should be deleted
+  local partitions=$(_device_get_partitions "${device}")
+  if [[ "${partition_count}" > 1 ]]; then
+    read -p "Do you want to delete the partitions? (yY)" -n 1 -r
+    echo    # (optional) move to a new line
+    if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+      sudo wipefs -a /dev/${device}
+    fi
   fi
+
+  # --- [write] image to sd card 
+  read -p "Do you want to copy the image to device ${device}? (yY)" -n 1 -r && echo
+  if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+    _dd ${device} ${file_image} 
+    sleep 10
+  fi
+
+  # --- [mount] sd card partitions seperately
+  mkdir -p "${path_boot}" "${path_rootfs}" 
+  # remove surrounding whitespace characters
+  device="${device#"${device%%[![:space:]]*}"}"
+  device="${device%"${device##*[![:space:]]}"}"   
+  partitions=$(_device_get_partitions "${device}")
+  while IFS= read -r partition; do
+      if [ "${partition}" = "p1" ]; then
+        echo "- mount ${partition} to ${path_boot}"
+        sudo mount /dev/${device}p1 "${path_boot}" 
+      fi 
+      if [ "${partition}" = "p2" ]; then
+        echo "- mount ${partition} to ${path_rootfs}"
+        sudo mount /dev/${device}p2 "${path_rootfs}" 
+      fi 
+  done <<< "$partitions"
+
+  # --- [config] ssh
+  sudo touch "${path_boot}"/ssh
+
+  # --- [config] dhcp 
+  echo "interface eth0" | sudo tee -a "${file_interface}"
+  echo "static ip_address=${ip_pi}/24" | sudo tee -a "${file_interface}"
+  echo "static routers=${ip_dhcp}" | sudo tee -a "${file_interface}"
+  echo "static domain_name_servers=${ip_dhcp}" | sudo tee -a "${file_interface}"
+
+  # --- [sync] the written files 
+  sync
+
+  # --- [umount] the partitions
+  # sudo umount "${path_rootfs}"
+  # sudo umount "${path_boot}"
+
+  # --- [log]  
+  echo "FINISHED" 
 
 }
 
+_get_free_ip() {
+  local interface=enp0s31f6
+  local ip_dhcp=192.168.178.1
+  local ip_first_3=$(echo ${ip_dhcp} | head -c 11)
+  echo "interface: ${interface}" 
+  echo "ip_first_3: ${ip_first_3}" 
+  # sudo arp-scan -I ${interface} --localnet --plain
+  local ips_used=$(sudo arp-scan -I ${interface} --localnet --plain | awk '{print $1}')
+  echo "ips_used: ${ips_used}" 
+  echo "free ips"
+  for (( i = 1; i < 256; i++ )); do
+    local ip_to_check="${ip_first_3}"."${i}"
+    if [[ "${ips_used}" != *"${ip_to_check}"* ]]; then
+      echo ${ip_to_check} 
+    fi
+  done | fzf
+
+}
+
+_interface_get_dhcp_ip() {
+  local interface=$(ip addr | grep -v "^  " | awk '{print $2}' | rev | cut -c 2- | rev | fzf)
+  local ip_dhcp=$(ip route | grep ${interface} | grep default | awk '{print $3}')
+  echo ${ip_dhcp}
+}
+
+_dd() {
+  echo "device: ${device}" 
+  echo "file_image: ${file_image}" 
+  sudo umount /dev/"${1}" 2>/dev/null
+  cd ${PATH_BASE} 
+  sudo dd if=${2} of=/dev/${1} bs=16M
+}
+
+_device_get_partitions() {
+  # remove leading whitespace characters
+  local device="${1#"${1%%[![:space:]]*}"}"
+  # remove trailing whitespace characters
+  device="${device%"${device##*[![:space:]]}"}"   
+  local partitions=$(
+    lsblk | 
+      tail -n +2 | 
+      grep -v "${device} " | 
+      grep "${device}" | 
+      awk '{print $1}' | 
+      xargs -I {} sh -c "p={}; echo \${p:2}" |
+      xargs -I {} sh -c "p={}; echo \${p:${#device}}"
+  )
+  echo "${partitions}"
+}
+
 _remove_partitions() {
-  sudo sfdisk -l /dev/"${device}" | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3 | xargs -I {} sh -c "partition={}; echo \${partition#\"\\${device}\"}"
+  # sudo sfdisk -l /dev/"${device}" | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3 | xargs -I {} sh -c "partition={}; echo \${partition#\"\\${device}\"}"
+  local device_choosen="${PIK_DEVICE}" 
+  if [[ -z "${PIK_DEVICE}" ]]; then
+    local devices=$(lsblk | tail -n +2 | grep mmcblk | grep -Fv -e "└" -e "├")
+    device_choosen=$(echo "${devices}" | fzf | awk '{print $1}')
+  fi 
+  echo "device_choosen: ${device_choosen}" 
+  local device_len= 
+  local partitions=$(
+    lsblk | 
+      tail -n +2 | 
+      grep -v "${device_choosen} " | 
+      grep "${device_choosen}" | 
+      awk '{print $1}' | 
+      xargs -I {} sh -c "p={}; echo \${p:2}" |
+      xargs -I {} sh -c "p={}; echo \${p:${#device_choosen}}"
+  )
+  echo -e "partitions: \n${partitions}" 
+
+  # [ -z "${device}" ] && echo "No device choosen. Aborted!" && exit
+  # sudo sfdisk -l /dev/"${device}" | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3
 }
 
 # --- calsecs_help
@@ -51,22 +213,29 @@ _help() {
 pic <ACTION> <OPTIONS>
   actions:
     h: help
+    I: init pi
     S: setup pi sd-card
+    T: test
   options:
+    d: device name
 EOF
 }
 
 # --- check if option passed
 [[ -z "${1}" ]] && _help
-while getopts "dhS" opt; do
+while getopts "d:hsST" opt; do
   case ${opt} in
 
     # --- OPTIONS
-    d) CALSECS_DELETE=true ;;
+    d) PIK_DEVICE=$OPTARG ;;
+    s) ACTION=action_ssh_connect ;;
 
     # --- ACTIONS
     h) ACTION=_help ;;
     S) ACTION=action_sd_setup ;;
+    # T) ACTION=_dd ;;
+    # T) ACTION=_remove_partitions; PIK_DEVICE=mmcblk0 ;;
+    T) ACTION=_get_free_ip ;;
 
     # --- MISC
     \? ) echo "Invalid option: $OPTARG" 1>&2 ;;
