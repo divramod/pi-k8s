@@ -3,3 +3,4 @@ images
 .secrets/*
 !*.secret
 ansible/hosts.ini
+.tmp
