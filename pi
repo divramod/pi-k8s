@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+: "${PATH_BASE:="$(git rev-parse --show-toplevel)"}" 
+ACTION=''
+
+# --- prepare a sd card for a headless start
+# * tut https://carpie.net/articles/headless-pi-with-static-ip-wired-edition
+# * rasbian https://www.raspberrypi.org/downloads/raspbian
+# * list devices https://www.lifewire.com/how-to-use-linux-to-find-the-names-of-the-devices-on-your-computer-4078068
+action_sd_setup() {
+  echo 'setup sd'
+  mkdir -p images
+  cd "${PATH_BASE}" 
+  local images_count=$(find images -name '*.img' -type f | wc -l)
+  local file_image
+  [ "${images_count}" == 0 ] && echo "No image existant. Download one at https://www.raspberrypi.org/downloads/raspbian!" && exit
+    file_image=$(find images -name '*.img' -type f | fzf)
+  [ -z "${file_image}" ] && echo "No image choosen. Aborted!" && exit
+  local device=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep "mmcblk" | fzf)
+  [ -z "${device}" ] && echo "No device choosen. Aborted!" && exit
+  local partition_count=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep ${device} | wc -l)
+  echo "partition_count: ${partition_count}" 
+  if [[ "${partition_count}" > 1 ]]; then
+    read -p "Do you want to delete some partitions? (yY)" -n 1 -r
+    echo    # (optional) move to a new line
+    if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+      echo "Deleting now"
+      # local partition_count=$(lsblk --noheadings --raw -o NAME,MOUNTPOINT | awk '$1~/[[:digit:]]/ && $2 == ""' | grep ${device} | wc -l)
+      # local partitions=$(sudo sfdisk -l /dev/mmcblk0 | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3)
+      sudo sfdisk -l /dev/"${device}" | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3 | xargs -I {} sh -c "partition={}; echo \${partition}"
+    fi
+  fi
+  echo "file_image: ${file_image}"
+  echo "device: ${device}" 
+  read -p "Do you want to copy the image ${file_image} to device ${device}? (yY)" -n 1 -r
+  echo    # (optional) move to a new line
+  if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+    # sudo umount /dev/"${device}" 2>/dev/null
+    # sudo dd if="${PATH_BASE}/${file_image}" of=/dev/"${device}" bs=16M
+    echo
+  fi
+
+}
+
+_remove_partitions() {
+  sudo sfdisk -l /dev/"${device}" | grep 'dev' | grep -v 'Disk' | awk '{print $1}' | cut -d "/" -f 3 | xargs -I {} sh -c "partition={}; echo \${partition#\"\\${device}\"}"
+}
+
+# --- calsecs_help
+help() {
+  cat << EOF
+calsecs <ACTION> <OPTIONS>
+  actions:
+    h: help
+    S: setup pi sd-card
+  options:
+EOF
+}
+
+# --- check if option passed
+[[ -z "${1}" ]] && calsecs_help
+while getopts "dhS" opt; do
+  case ${opt} in
+
+    # --- OPTIONS
+    d) CALSECS_DELETE=true ;;
+
+    # --- ACTIONS
+    h) ACTION=help ;;
+    S) ACTION=action_sd_setup ;;
+
+    # --- MISC
+    \? ) echo "Invalid option: $OPTARG" 1>&2 ;;
+    : ) echo "Invalid option: $OPTARG requires an argument" 1>&2 ;;
+  esac
+done
+shift $((OPTIND -1))
+[[ -n "${ACTION}" ]] && ${ACTION}
